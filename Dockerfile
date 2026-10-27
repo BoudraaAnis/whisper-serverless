@@ -23,34 +23,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2. تثبيت مكتبة RunPod Serverless الرسمية
 RUN pip3 install --no-cache-dir runpod
 
-# 3. تحميل وبناء مكتبة whisper.cpp بـ C++ مع تفعيل CUDA GPU لـ RTX 3090 و RTX 4090
-RUN git clone --depth 1 https://github.com/ggerganov/whisper.cpp.git /workspace/whisper.cpp && \
-    mkdir -p /workspace/whisper.cpp/build && \
-    cd /workspace/whisper.cpp/build && \
-    cmake -DGGML_CUDA=1 -DBUILD_SHARED_LIBS=ON -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES="80;86;89" .. && \
-    make -j2 && \
-    make install && \
-    ldconfig
-
-# 4. نسخ ملفات المحرك
+# 3. نسخ ملفات المحرك والمعالج
 COPY whisper_ultra_engine.cpp /workspace/
 COPY handler.py /workspace/
 
-# 5. تجميع محرك whisper_ultra_engine بلغة C++
-RUN g++ -O3 -std=c++17 /workspace/whisper_ultra_engine.cpp \
-    -I/workspace/whisper.cpp/include \
-    -I/workspace/whisper.cpp/ggml/include \
-    -L/workspace/whisper.cpp/build \
-    -lwhisper -lpthread -ldl \
-    -o /workspace/whisper_ultra_engine
+# 4. بناء محرك C++ ومكتبة whisper عبر CMake مع تسريع CUDA GPU لكروت RTX 3090 و RTX 4090
+RUN git clone --depth 1 https://github.com/ggerganov/whisper.cpp.git /workspace/whisper_src && \
+    cp /workspace/whisper_ultra_engine.cpp /workspace/whisper_src/ && \
+    printf "\nadd_executable(whisper_ultra_engine whisper_ultra_engine.cpp)\ntarget_include_directories(whisper_ultra_engine PRIVATE \${CMAKE_CURRENT_SOURCE_DIR}/include \${CMAKE_CURRENT_SOURCE_DIR}/ggml/include)\ntarget_link_libraries(whisper_ultra_engine PRIVATE whisper)\n" >> /workspace/whisper_src/CMakeLists.txt && \
+    mkdir -p /workspace/whisper_src/build && \
+    cd /workspace/whisper_src/build && \
+    cmake -DGGML_CUDA=1 -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES="80;86;89" .. && \
+    cmake --build . --config Release --target whisper_ultra_engine -j2 && \
+    find . -name "whisper_ultra_engine" -type f -exec cp {} /workspace/whisper_ultra_engine \; && \
+    chmod +x /workspace/whisper_ultra_engine && \
+    rm -rf /workspace/whisper_src
 
-# 6. تحميل نموذج Large-v3-Turbo المحسن مسبقاً داخل الحاوية
+# 5. تحميل نموذج Large-v3-Turbo المحسن مسبقاً داخل الحاوية
 RUN mkdir -p /workspace/models && \
     wget -q -O /workspace/models/ggml-large-v3-turbo.bin \
     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
 
-# ضبط مسار المكتبات المشتركة
-ENV LD_LIBRARY_PATH="/workspace/whisper.cpp/build:${LD_LIBRARY_PATH}"
-
-# تشغيل المعالج
+# 6. تشغيل المعالج السحابي عند الطلب
 CMD ["python3", "-u", "/workspace/handler.py"]
