@@ -23,12 +23,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2. تثبيت مكتبة RunPod Serverless الرسمية
 RUN pip3 install --no-cache-dir runpod
 
-# 3. تحميل وبناء مكتبة whisper.cpp بـ C++ مع تفعيل CUDA GPU
+# 3. تحميل وبناء مكتبة whisper.cpp بـ C++ مع تفعيل CUDA GPU لـ RTX 3090 و RTX 4090
 RUN git clone --depth 1 https://github.com/ggerganov/whisper.cpp.git /workspace/whisper.cpp && \
     mkdir -p /workspace/whisper.cpp/build && \
     cd /workspace/whisper.cpp/build && \
-    cmake -DGGML_CUDA=1 -DBUILD_SHARED_LIBS=ON .. && \
-    make -j$(nproc) && \
+    cmake -DGGML_CUDA=1 -DBUILD_SHARED_LIBS=ON -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_TESTS=OFF -DCMAKE_CUDA_ARCHITECTURES="80;86;89" .. && \
+    make -j2 && \
     make install && \
     ldconfig
 
