@@ -68,8 +68,9 @@ def handler(job):
     try:
         job_input = job.get("input", {})
         audio_b64 = job_input.get("audio_base64", "")
-        if not audio_b64:
-            return {"error": "No audio_base64 provided"}
+        audio_url = job_input.get("audio_url", "")
+        if not audio_b64 and not audio_url:
+            return {"error": "No audio_base64 or audio_url provided"}
 
         use_librosa = job_input.get("use_librosa", True)
         custom_dict = job_input.get("custom_dict", "")
@@ -78,8 +79,15 @@ def handler(job):
             raw_path = os.path.join(tmpdir, "input_raw")
             wav_path = os.path.join(tmpdir, "input_16k.wav")
 
-            with open(raw_path, "wb") as f:
-                f.write(base64.b64decode(audio_b64))
+            if audio_url:
+                import urllib.request
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                req = urllib.request.Request(audio_url, headers=headers)
+                with urllib.request.urlopen(req) as resp, open(raw_path, 'wb') as out_f:
+                    out_f.write(resp.read())
+            else:
+                with open(raw_path, "wb") as f:
+                    f.write(base64.b64decode(audio_b64))
 
             # تحويل الصوت بـ FFmpeg عالي السرعة
             ff_cmd = ["ffmpeg", "-y", "-i", raw_path]
