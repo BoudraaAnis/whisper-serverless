@@ -1,97 +1,110 @@
-import os
-import sys
-import json
-import base64
-import tempfile
-import subprocess
+import os, sys, json, base64, tempfile, subprocess, re
 import runpod
+from faster_whisper import WhisperModel
 
-# مسار النموذج المترجم ومسار محرك C++
-ENGINE_BIN = "/workspace/whisper_ultra_engine"
-MODEL_TURBO = "/workspace/models/ggml-large-v3-turbo.bin"
-MODEL_LARGE = "/workspace/models/ggml-large-v3.bin"
+# تحميل النموذج مسبقاً في الذاكرة لسرعة الإقلاع الفوري (FlashBoot)
+MODEL_DIR = "/workspace/models"
+print("🚀 Loading Whisper Large-v3-Turbo Model on GPU...", flush=True)
+model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16", download_root=MODEL_DIR)
+print("✅ Whisper Ultra Engine is READY on GPU!", flush=True)
+
+def format_time(seconds):
+    s = int(seconds)
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+def apply_ultra_rules(words_list, custom_dict_str):
+    # 1. دمج الأرقام والكسور (مثل 4 و 5 ⬅️ 4.5)
+    merged = []
+    i = 0
+    while i < len(words_list):
+        if i + 1 < len(words_list):
+            w1, t1 = words_list[i]
+            w2, t2 = words_list[i+1]
+            if w1.isdigit() and w2.isdigit() and len(w2) == 1 and abs(t2 - t1) <= 0.5:
+                merged.append((f"{w1}.{w2}", t1))
+                i += 2
+                continue
+        merged.append(words_list[i])
+        i += 1
+
+    # 2. القواعد التقنية الشائعة
+    tech_rules = [
+        (r"\b(كات\s*اوف|كاتوف|cut\s*off)\b", "Cut-off"),
+        (r"\b(ساتوريشن|saturation)\b", "Saturation"),
+        (r"\b(ياما)\b", "يا إما"),
+        (r"\b(ترانزستور|ترانزيستور)\b", "Transistor"),
+        (r"\b(كولكتور|كوليكتور)\b", "Collector"),
+        (r"\b(اميتر|إميتر)\b", "Emitter"),
+        (r"\b(بيز|بيس)\b", "Base"),
+        (r"\b(في\s*اوت|v\s*out)\b", "V output"),
+        (r"\b(تو\s*سيجنالز)\b", "Two signals"),
+    ]
+
+    # 3. القاموس المخصص للمستخدم
+    custom_rules = []
+    if custom_dict_str:
+        for line in custom_dict_str.splitlines():
+            line = line.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip() and v.strip():
+                    custom_rules.append((k.strip(), v.strip()))
+
+    # بناء الأسطر بالتنسيق المطلوب: "00:00:00 الكلمة"
+    output_lines = []
+    for w, t in merged:
+        for pat, rep in tech_rules:
+            w = re.sub(pat, rep, w, flags=re.IGNORECASE)
+        for k, v in custom_rules:
+            w = w.replace(k, v)
+        output_lines.append(f"{format_time(t)} {w}")
+
+    return "\n".join(output_lines)
 
 def handler(job):
-    """
-    معالج RunPod Serverless:
-    يستقبل طلب برنامج C++ المكتبي، وينفذ المعالجة عبر محرك C++ و CUDA GPU
-    """
-    job_input = job.get("input", {})
-    
-    # 1. استخراج ملف الصوت من Base64
-    audio_b64 = job_input.get("audio_base64", "")
-    if not audio_b64:
-        return {"error": "Missing audio_base64 in payload"}
-    
-    model_choice = job_input.get("model", "large-v3-turbo")
-    merge_fractions = "1" if job_input.get("merge_fractions", True) else "0"
-    use_librosa = job_input.get("use_librosa", True)
-    custom_dict = job_input.get("custom_dict", "")
+    try:
+        job_input = job.get("input", {})
+        audio_b64 = job_input.get("audio_base64", "")
+        if not audio_b64:
+            return {"error": "No audio_base64 provided"}
 
-    # اختيار مسار النموذج
-    model_path = MODEL_TURBO if "turbo" in model_choice else MODEL_LARGE
-    if not os.path.exists(model_path):
-        model_path = MODEL_TURBO
+        use_librosa = job_input.get("use_librosa", True)
+        custom_dict = job_input.get("custom_dict", "")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_audio_path = os.path.join(tmpdir, "input_raw")
-        wav_16k_path = os.path.join(tmpdir, "input_16k.wav")
-        dict_path = os.path.join(tmpdir, "custom_dict.txt")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_path = os.path.join(tmpdir, "input_raw")
+            wav_path = os.path.join(tmpdir, "input_16k.wav")
 
-        # حفظ ملف الصوت الأولي
-        with open(input_audio_path, "wb") as f:
-            f.write(base64.b64decode(audio_b64))
+            with open(raw_path, "wb") as f:
+                f.write(base64.b64decode(audio_b64))
 
-        # حفظ القاموس المخصص
-        with open(dict_path, "w", encoding="utf-8") as f:
-            f.write(custom_dict)
+            # تحويل الصوت بـ FFmpeg عالي السرعة
+            ff_cmd = ["ffmpeg", "-y", "-i", raw_path]
+            if use_librosa:
+                ff_cmd += ["-af", "highpass=f=100,lowpass=f=7500,afftdn=nf=-25"]
+            ff_cmd += ["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav_path]
+            subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-        # 2. تحويل الصوت وتصفيته إلى WAV 16kHz Mono
-        # استخدام ffmpeg عالي السرعة مع فلترة الصوت
-        if use_librosa:
-            # تنقية وعزل الصوت مع فلتر إزالة التشويش
-            ffmpeg_cmd = [
-                "ffmpeg", "-y", "-i", input_audio_path,
-                "-af", "highpass=f=100,lowpass=f=7500,afftdn=nf=-25",
-                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-                wav_16k_path
-            ]
-        else:
-            ffmpeg_cmd = [
-                "ffmpeg", "-y", "-i", input_audio_path,
-                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-                wav_16k_path
-            ]
+            # تفريغ الصوت العصبي بدقة كلمة بكلمة
+            segments, info = model.transcribe(wav_path, word_timestamps=True, vad_filter=True)
 
-        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            words_list = []
+            for seg in segments:
+                if seg.words:
+                    for w in seg.words:
+                        clean_w = w.word.strip()
+                        if clean_w:
+                            words_list.append((clean_w, w.start))
 
-        # 3. تشغيل محرك C++ الصافي مع الـ GPU
-        engine_cmd = [
-            ENGINE_BIN,
-            model_path,
-            wav_16k_path,
-            merge_fractions,
-            dict_path
-        ]
+            result_text = apply_ultra_rules(words_list, custom_dict)
+            return {"text": result_text}
 
-        proc = subprocess.run(engine_cmd, capture_output=True, text=True, check=True)
-        output_stdout = proc.stdout
-
-        # استخراج مخرجات الـ JSON من C++
-        if "---JSON_START---" in output_stdout and "---JSON_END---" in output_stdout:
-            json_str = output_stdout.split("---JSON_START---")[1].split("---JSON_END---")[0].strip()
-            result_data = json.loads(json_str)
-            return {
-                "text": result_data.get("text", ""),
-                "execution_time": result_data.get("execution_time", 0.0),
-                "engine": "C++ Whisper.cpp CUDA"
-            }
-        else:
-            return {
-                "text": output_stdout.strip(),
-                "engine": "C++ Whisper.cpp Direct"
-            }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "trace": traceback.format_exc()}
 
 if __name__ == "__main__":
-    # بدء خادم RunPod Serverless
     runpod.serverless.start({"handler": handler})
